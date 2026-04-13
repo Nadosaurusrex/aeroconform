@@ -1,0 +1,20 @@
+# AeroConform Inference Configuration
+data:
+  target_fir: LIMM
+  seq_len: 128
+  features:
+    - latitude
+    - longitude
+    - baro_altitude
+    - velocity
+    - true_track
+    - vertical_rate
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  poll_interval: 10
+
+opensky:
+  base_url: "https://opensky-network.org/api"
+  rate_limit_interval: 10
