@@ -1,0 +1,25 @@
+data:
+  fir: LIMM
+  bbox:
+    west: 6.5
+    south: 44.0
+    east: 13.5
+    north: 47.0
+  context_length: 128
+  min_flight_observations: 20
+  gap_threshold_minutes: 30
+  features:
+    - latitude
+    - longitude
+    - baro_altitude
+    - velocity
+    - sin_track
+    - cos_track
+    - vertical_rate
+    - on_ground
+
+opensky:
+  poll_interval_seconds: 10
+  rate_limit_seconds: 5
+  token_url: "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+  api_base_url: "https://opensky-network.org/api"

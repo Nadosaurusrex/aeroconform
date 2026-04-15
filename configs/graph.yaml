@@ -1,0 +1,22 @@
+graph:
+  conv_type: GATv2Conv
+  num_layers: 2
+  hidden_dim: 128
+  num_heads: 4
+  edge_dim: 5
+  dropout: 0.1
+  residual: true
+  output_dim: 64
+  joint_loss_weight: 0.1
+
+edges:
+  max_distance_nm: 50
+  altitude_sep_ft: 1000
+  lateral_distance_nm: 10
+  min_observations: 5
+
+conformal:
+  alpha: 0.01
+  buffer_size: 2000
+  decay: 0.995
+  score_weight: 0.5
