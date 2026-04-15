@@ -2,6 +2,10 @@
 
 Trino is the primary data source via pyopensky. REST is used for
 live state vector polling and as a fallback for historical data.
+
+pyopensky's Trino class has no timeout configuration, which causes
+hangs on cloud environments (Colab, etc.). We monkey-patch it to add
+explicit timeouts at both the auth and query levels.
 """
 
 from __future__ import annotations
@@ -9,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 import polars as pl
@@ -24,17 +28,78 @@ from src.utils.constants import (
 
 logger = structlog.get_logger(__name__)
 
+# Timeout settings for Trino (seconds)
+TRINO_AUTH_TIMEOUT = 30.0
+TRINO_REQUEST_TIMEOUT = 300
+
 
 class TrinoUnavailableError(Exception):
     """Raised when Trino connection is unavailable."""
+
+
+def _patch_pyopensky_timeouts() -> None:
+    """Monkey-patch pyopensky's Trino class to add timeout configuration.
+
+    pyopensky's Trino.token() uses httpx.post() with no timeout,
+    and Trino.engine() creates a SQLAlchemy engine with no request_timeout.
+    Both hang on cloud environments like Colab.
+
+    This patches both methods to add explicit timeouts.
+    """
+    try:
+        import pyopensky.trino as _trino_mod
+    except ImportError:
+        return
+
+    _original_token = _trino_mod.Trino.token
+    _original_engine = _trino_mod.Trino.engine
+
+    def _patched_token(self, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        """Token method with explicit httpx timeout."""
+        kwargs.setdefault("timeout", TRINO_AUTH_TIMEOUT)
+        return _original_token(self, **kwargs)
+
+    def _patched_engine(self):  # noqa: ANN001, ANN202
+        """Engine method with request_timeout in connect_args."""
+        from sqlalchemy import create_engine
+        from trino.auth import JWTAuthentication, OAuth2Authentication
+        from trino.sqlalchemy import URL
+
+        token = self.token()
+
+        trino_username = getattr(_trino_mod, "trino_username", None)
+        engine = create_engine(
+            URL(
+                "trino.opensky-network.org",
+                port=443,
+                user=trino_username,
+                catalog="minio",
+                schema="osky",
+                source="pyopensky",
+            ),
+            connect_args={
+                "auth": JWTAuthentication(token) if token is not None else OAuth2Authentication(),
+                "http_scheme": "https",
+                "legacy_prepared_statements": True,
+                "request_timeout": TRINO_REQUEST_TIMEOUT,
+            },
+        )
+        return engine
+
+    _trino_mod.Trino.token = _patched_token
+    _trino_mod.Trino.engine = _patched_engine
+    logger.info(
+        "pyopensky_patched",
+        auth_timeout=TRINO_AUTH_TIMEOUT,
+        request_timeout=TRINO_REQUEST_TIMEOUT,
+    )
 
 
 class TrinoClient:
     """Historical data access via pyopensky Trino interface.
 
     Wraps pyopensky.trino.Trino for querying state_vectors_data4.
-    pyopensky handles OAuth2 token refresh and automatic hour-partition
-    splitting internally.
+    Patches pyopensky to add timeouts that prevent hangs on cloud.
     """
 
     def __init__(
@@ -45,15 +110,50 @@ class TrinoClient:
         self._trino = None
 
     def _get_trino(self):  # noqa: ANN202
-        """Lazy-initialize pyopensky Trino connection."""
+        """Lazy-initialize pyopensky Trino connection with timeout patches."""
         if self._trino is None:
             try:
+                _patch_pyopensky_timeouts()
                 from pyopensky.trino import Trino
 
                 self._trino = Trino()
+                logger.info("trino_client_initialized")
             except Exception as e:
-                raise TrinoUnavailableError(f"Cannot connect to Trino: {e}") from e
+                raise TrinoUnavailableError(f"Cannot initialize Trino: {e}") from e
         return self._trino
+
+    def test_connectivity(self) -> dict[str, bool | str]:
+        """Test connectivity to Trino auth and query servers.
+
+        Returns dict with 'auth_ok', 'query_ok', and any error messages.
+        Useful for diagnosing Colab connectivity issues.
+        """
+        result: dict[str, bool | str] = {"auth_ok": False, "query_ok": False}
+
+        # Test 1: Can we reach the auth server?
+        try:
+            resp = httpx.get(
+                "https://auth.opensky-network.org/auth/realms/opensky-network",
+                timeout=10.0,
+            )
+            result["auth_ok"] = resp.status_code == 200
+            result["auth_status"] = str(resp.status_code)
+        except Exception as e:
+            result["auth_error"] = str(e)
+
+        # Test 2: Can we reach the Trino server?
+        try:
+            resp = httpx.get(
+                "https://trino.opensky-network.org/ui/",
+                timeout=10.0,
+            )
+            result["query_ok"] = resp.status_code in (200, 301, 302, 303, 307, 401)
+            result["query_status"] = str(resp.status_code)
+        except Exception as e:
+            result["query_error"] = str(e)
+
+        logger.info("trino_connectivity_test", **result)
+        return result
 
     def query_state_vectors(
         self,
@@ -62,30 +162,25 @@ class TrinoClient:
         *,
         icao24: str | list[str] | None = None,
         columns: tuple[str, ...] | None = None,
-        chunk_hours: int = 4,
+        chunk_hours: int = 2,
         max_retries: int = 3,
     ) -> pl.DataFrame:
         """Query historical state vectors from Trino.
 
         Splits queries into smaller time chunks to avoid timeouts.
-        Retries failed chunks.
+        Retries failed chunks with exponential backoff.
 
         Args:
             start: Start time (ISO string or datetime).
             end: End time (ISO string or datetime).
             icao24: Filter by specific aircraft ICAO24 address(es).
-            columns: Specific columns to select. Defaults to all needed columns.
-            chunk_hours: Hours per query chunk (smaller = less likely to timeout).
+            columns: Specific columns to select.
+            chunk_hours: Hours per query chunk (default 2h).
             max_retries: Number of retries per chunk on failure.
 
         Returns:
             polars DataFrame with state vectors.
-
-        Raises:
-            TrinoUnavailableError: If Trino connection fails after all retries.
         """
-        from datetime import timedelta
-
         trino = self._get_trino()
 
         start_dt = start if isinstance(start, datetime) else datetime.fromisoformat(str(start))
@@ -113,25 +208,36 @@ class TrinoClient:
                 end=chunk_end.strftime("%Y-%m-%d %H:%M"),
             )
 
+            chunk_result = None
             for attempt in range(max_retries):
                 try:
-                    result = trino.history(**kwargs)
+                    chunk_result = trino.history(**kwargs)
                     break
                 except Exception as e:
                     if attempt < max_retries - 1:
-                        import time as _time
-
-                        wait = 10 * (attempt + 1)
-                        logger.warning("trino_retry", attempt=attempt + 1, wait=wait, error=str(e))
-                        _time.sleep(wait)
+                        wait = 15 * (attempt + 1)
+                        logger.warning(
+                            "trino_retry",
+                            attempt=attempt + 1,
+                            wait=wait,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                        time.sleep(wait)
+                        # Re-initialize connection on retry
+                        self._trino = None
+                        trino = self._get_trino()
                     else:
-                        raise TrinoUnavailableError(f"Trino query failed after {max_retries} retries: {e}") from e
+                        raise TrinoUnavailableError(
+                            f"Trino query failed after {max_retries} retries: {type(e).__name__}: {e}"
+                        ) from e
 
-            if result is not None and (not hasattr(result, '__len__') or len(result) > 0):
-                pdf = result.data if hasattr(result, 'data') else result
+            if chunk_result is not None and (not hasattr(chunk_result, "__len__") or len(chunk_result) > 0):
+                pdf = chunk_result.data if hasattr(chunk_result, "data") else chunk_result
                 chunk_df = pl.from_pandas(pdf)
                 all_dfs.append(chunk_df)
                 logger.info("trino_chunk_complete", rows=len(chunk_df))
+            else:
+                logger.info("trino_chunk_empty", start=current.strftime("%Y-%m-%d %H:%M"))
 
             current = chunk_end
 
@@ -141,7 +247,7 @@ class TrinoClient:
 
         df = pl.concat(all_dfs)
 
-        # Rename columns to match our schema (handle both pyopensky output formats)
+        # Rename columns to match our schema
         rename_map = {
             "timestamp": "time",
             "latitude": "lat",
@@ -156,9 +262,7 @@ class TrinoClient:
                 df = df.rename({old: new})
 
         # Convert timestamp to unix int if needed
-        if "time" in df.columns and (
-            df["time"].dtype == pl.Datetime or str(df["time"].dtype).startswith("Datetime")
-        ):
+        if "time" in df.columns and (df["time"].dtype == pl.Datetime or str(df["time"].dtype).startswith("Datetime")):
             df = df.with_columns(pl.col("time").dt.epoch("s").alias("time"))
 
         logger.info("trino_query_complete", rows=len(df))
@@ -248,10 +352,23 @@ class RESTClient:
             return pl.DataFrame()
 
         columns = [
-            "icao24", "callsign", "origin_country", "time_position",
-            "last_contact", "lon", "lat", "baroaltitude", "onground",
-            "velocity", "heading", "vertrate", "sensors", "geoaltitude",
-            "squawk", "spi", "position_source",
+            "icao24",
+            "callsign",
+            "origin_country",
+            "time_position",
+            "last_contact",
+            "lon",
+            "lat",
+            "baroaltitude",
+            "onground",
+            "velocity",
+            "heading",
+            "vertrate",
+            "sensors",
+            "geoaltitude",
+            "squawk",
+            "spi",
+            "position_source",
         ]
 
         rows = []
