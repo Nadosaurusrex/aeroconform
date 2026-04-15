@@ -62,50 +62,84 @@ class TrinoClient:
         *,
         icao24: str | list[str] | None = None,
         columns: tuple[str, ...] | None = None,
+        chunk_hours: int = 4,
+        max_retries: int = 3,
     ) -> pl.DataFrame:
         """Query historical state vectors from Trino.
 
-        pyopensky automatically splits queries by hour partition and handles
-        OAuth2 authentication.
+        Splits queries into smaller time chunks to avoid timeouts.
+        Retries failed chunks.
 
         Args:
             start: Start time (ISO string or datetime).
             end: End time (ISO string or datetime).
             icao24: Filter by specific aircraft ICAO24 address(es).
             columns: Specific columns to select. Defaults to all needed columns.
+            chunk_hours: Hours per query chunk (smaller = less likely to timeout).
+            max_retries: Number of retries per chunk on failure.
 
         Returns:
             polars DataFrame with state vectors.
 
         Raises:
-            TrinoUnavailableError: If Trino connection fails.
+            TrinoUnavailableError: If Trino connection fails after all retries.
         """
+        from datetime import timedelta
+
         trino = self._get_trino()
 
-        kwargs: dict = {
-            "start": start,
-            "stop": end,
-            "bounds": self.bounds,
-        }
-        if icao24 is not None:
-            kwargs["icao24"] = icao24
-        if columns is not None:
-            kwargs["selected_columns"] = columns
+        start_dt = start if isinstance(start, datetime) else datetime.fromisoformat(str(start))
+        end_dt = end if isinstance(end, datetime) else datetime.fromisoformat(str(end))
 
-        logger.info("trino_query_start", start=str(start), end=str(end), bounds=self.bounds)
+        all_dfs: list[pl.DataFrame] = []
+        current = start_dt
 
-        try:
-            result = trino.history(**kwargs)
-        except Exception as e:
-            raise TrinoUnavailableError(f"Trino query failed: {e}") from e
+        while current < end_dt:
+            chunk_end = min(current + timedelta(hours=chunk_hours), end_dt)
 
-        if result is None or (hasattr(result, '__len__') and len(result) == 0):
+            kwargs: dict = {
+                "start": current.strftime("%Y-%m-%d %H:%M"),
+                "stop": chunk_end.strftime("%Y-%m-%d %H:%M"),
+                "bounds": self.bounds,
+            }
+            if icao24 is not None:
+                kwargs["icao24"] = icao24
+            if columns is not None:
+                kwargs["selected_columns"] = columns
+
+            logger.info(
+                "trino_chunk_query",
+                start=current.strftime("%Y-%m-%d %H:%M"),
+                end=chunk_end.strftime("%Y-%m-%d %H:%M"),
+            )
+
+            for attempt in range(max_retries):
+                try:
+                    result = trino.history(**kwargs)
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        import time as _time
+
+                        wait = 10 * (attempt + 1)
+                        logger.warning("trino_retry", attempt=attempt + 1, wait=wait, error=str(e))
+                        _time.sleep(wait)
+                    else:
+                        raise TrinoUnavailableError(f"Trino query failed after {max_retries} retries: {e}") from e
+
+            if result is not None and (not hasattr(result, '__len__') or len(result) > 0):
+                pdf = result.data if hasattr(result, 'data') else result
+                chunk_df = pl.from_pandas(pdf)
+                all_dfs.append(chunk_df)
+                logger.info("trino_chunk_complete", rows=len(chunk_df))
+
+            current = chunk_end
+
+        if not all_dfs:
             logger.warning("trino_query_empty", start=str(start), end=str(end))
             return pl.DataFrame()
 
-        # pyopensky returns a pandas DataFrame directly
-        pdf = result.data if hasattr(result, 'data') else result
-        df = pl.from_pandas(pdf)
+        df = pl.concat(all_dfs)
 
         # Rename columns to match our schema (handle both pyopensky output formats)
         rename_map = {
@@ -122,9 +156,10 @@ class TrinoClient:
                 df = df.rename({old: new})
 
         # Convert timestamp to unix int if needed
-        if "time" in df.columns:
-            if df["time"].dtype == pl.Datetime or str(df["time"].dtype).startswith("Datetime"):
-                df = df.with_columns(pl.col("time").dt.epoch("s").alias("time"))
+        if "time" in df.columns and (
+            df["time"].dtype == pl.Datetime or str(df["time"].dtype).startswith("Datetime")
+        ):
+            df = df.with_columns(pl.col("time").dt.epoch("s").alias("time"))
 
         logger.info("trino_query_complete", rows=len(df))
         return df
